@@ -1,0 +1,21 @@
+[tool.poetry]
+name = "h3-spatial-engine"
+version = "0.1.0"
+description = "H3 DGGS spatial query engine with DuckDB backend"
+authors = ["Sebastian Gmur"]
+packages = [{include = "h3_spatial_engine"}]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+h3 = "^4.0.0"
+duckdb = "^1.2.0"
+shapely = "^2.0.0"
+geopandas = "^1.0.0"
+pyproj = "^3.6.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
