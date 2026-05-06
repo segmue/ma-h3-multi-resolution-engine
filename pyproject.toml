@@ -1,9 +1,9 @@
 [tool.poetry]
-name = "h3-spatial-engine"
+name = "h3-multi-resolution-index"
 version = "0.1.0"
-description = "H3 DGGS spatial query engine with DuckDB backend"
+description = "H3 multi-resolution spatial index with DuckDB backend"
 authors = ["Sebastian Gmur"]
-packages = [{include = "h3_spatial_engine"}]
+packages = [{include = "h3_multi_resolution_engine"}]
 
 [tool.poetry.dependencies]
 python = "^3.11"

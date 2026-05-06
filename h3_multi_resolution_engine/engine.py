@@ -16,7 +16,7 @@ Architektur (Lazy Evaluation):
     Ausfuehrung: area(CellSet) oder CellSet.run() materialisiert die Query
 
 Verwendung:
-    from h3_spatial_engine import H3Engine
+    from h3_multi_resolution_engine import H3Engine
 
     db = H3Engine("data.duckdb")
 
@@ -46,7 +46,7 @@ from typing import Union, TYPE_CHECKING
 import duckdb
 
 if TYPE_CHECKING:
-    from h3_spatial_engine import H3Engine as _H3Engine
+    from h3_multi_resolution_engine import H3Engine as _H3Engine
 
 # Typ-Alias fuer Predicate-Argumente: SQL-String oder DuckDB Relation
 FeatureSet = Union[str, duckdb.DuckDBPyRelation]

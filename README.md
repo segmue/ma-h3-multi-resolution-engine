@@ -7,7 +7,7 @@ Converts vector geometries to H3 cells and provides spatial predicates across re
 Geometries → H3 cells, with adaptive resolution for polygons (chosen by area to hit a target cell count). Points/lines get a fixed resolution.
 
 ```python
-from h3_spatial_engine import convert_geometry_to_h3
+from h3_multi_resolution_engine import convert_geometry_to_h3
 
 # Point → single cell at max resolution
 cells, res = convert_geometry_to_h3(Point(8.54, 47.37))
@@ -25,7 +25,7 @@ cells_list, res_list = convert_geodataframe_to_h3(gdf, target_cells=1000)
 Once stored in DuckDB, `H3Engine` provides lazy set operations and eager predicates. Cross-resolution comparison via `h3_cell_to_parent()`.
 
 ```python
-from h3_spatial_engine import H3Engine
+from h3_multi_resolution_engine import H3Engine
 
 db = H3Engine("spatial.duckdb")
 wald = db.union("OBJEKTART = 'Wald'")
