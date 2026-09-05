@@ -591,15 +591,35 @@ class H3Engine:
             where_parts.append(f"f.feature_id NOT IN ({ids_str})")
         where_clause = " AND ".join(where_parts)
 
-        order_clause = ""
+        # feature_id als (Tie-)Breaker macht die Reihenfolge deterministisch —
+        # noetig, damit Einzel- und Batch-Pfad identische Saetze erzeugen.
         if order_by_size:
             order_clause = """
                 ORDER BY f.h3_cell_count * h3_cell_area(
                     h3_cell_to_parent(0, f.h3_resolution), 'km^2'
-                ) ASC
+                ) ASC, f.feature_id
             """
+        else:
+            order_clause = "ORDER BY f.feature_id"
 
         limit_clause = f"LIMIT {int(max_results)}" if max_results else ""
+
+        # Feature-Attribut-Filter in die CTEs pushen (wie find_overlapping_features):
+        # reduziert die teure h3_lookup-Seite drastisch, bevor gejoint wird.
+        # Semantisch redundant zum finalen WHERE, daher ergebnisneutral.
+        push_parts = []
+        if objektart_list:
+            quoted = ", ".join(f"'{o}'" for o in objektart_list)
+            push_parts.append(f"OBJEKTART IN ({quoted})")
+        if dataset is not None:
+            push_parts.append(f"source = '{dataset}'")
+        if push_parts:
+            target_subquery = (
+                f"SELECT feature_id FROM features WHERE {' AND '.join(push_parts)}"
+            )
+            lookup_extra = f"\n                  AND l.feature_id IN ({target_subquery})"
+        else:
+            lookup_extra = ""
 
         sql = f"""
             WITH source AS (
@@ -617,13 +637,22 @@ class H3Engine:
                     FROM source s,
                          (SELECT DISTINCT cell_res FROM h3_lookup) tr
                     WHERE tr.cell_res <= s.cell_res
-                ) sp ON l.cell = sp.parent_cell AND l.cell_res = sp.target_res
+                ) sp ON l.cell = sp.parent_cell AND l.cell_res = sp.target_res{lookup_extra}
             ),
             finer_matches AS (
-                SELECT DISTINCT l.feature_id
-                FROM h3_lookup l
-                JOIN source s ON h3_cell_to_parent(l.cell, s.cell_res) = s.cell
-                WHERE l.cell_res > s.cell_res
+                -- Equi-Join-Formulierung (wie Batch-Variante): Parent gegen die
+                -- (eine) Source-Resolution vorberechnen, damit DuckDB hash-joinen
+                -- kann statt nested-loopen.
+                SELECT DISTINCT lp.feature_id
+                FROM (
+                    SELECT l.feature_id,
+                           sr.cell_res AS src_res,
+                           h3_cell_to_parent(l.cell, sr.cell_res) AS parent_cell
+                    FROM h3_lookup l
+                    JOIN (SELECT DISTINCT cell_res FROM source) sr
+                      ON l.cell_res > sr.cell_res{lookup_extra}
+                ) lp
+                JOIN source s ON s.cell_res = lp.src_res AND s.cell = lp.parent_cell
             ),
             all_matches AS (
                 SELECT feature_id FROM coarser_matches
@@ -725,11 +754,19 @@ class H3Engine:
                 GROUP BY l.feature_id
             ),
             finer_matches AS (
-                SELECT l.feature_id, COUNT(*) as overlap_cells
-                FROM h3_lookup l
-                JOIN source s ON h3_cell_to_parent(l.cell, s.cell_res) = s.cell
-                WHERE l.cell_res > s.cell_res{fine_extra}
-                GROUP BY l.feature_id
+                -- Equi-Join-Formulierung (wie Batch-Variante); jede finer Zelle
+                -- hat genau einen Parent pro Resolution -> COUNT(*) bleibt exakt.
+                SELECT lp.feature_id, COUNT(*) as overlap_cells
+                FROM (
+                    SELECT l.feature_id,
+                           sr.cell_res AS src_res,
+                           h3_cell_to_parent(l.cell, sr.cell_res) AS parent_cell
+                    FROM h3_lookup l
+                    JOIN (SELECT DISTINCT cell_res FROM source) sr
+                      ON l.cell_res > sr.cell_res{fine_extra}
+                ) lp
+                JOIN source s ON s.cell_res = lp.src_res AND s.cell = lp.parent_cell
+                GROUP BY lp.feature_id
             ),
             all_matches AS (
                 SELECT feature_id, SUM(overlap_cells) as overlap_cells
@@ -744,8 +781,196 @@ class H3Engine:
             FROM all_matches m
             JOIN features f ON m.feature_id = f.feature_id
             WHERE {' AND '.join(feature_filters)}
-            ORDER BY m.overlap_cells DESC
+            ORDER BY m.overlap_cells DESC, f.feature_id
             LIMIT {int(max_results)}
+        """
+
+        return self.conn.sql(sql)
+
+    # -------------------------------------------------------------------------
+    # Batch-Varianten (ein set-basierter Query fuer viele Quell-Features)
+    #
+    # Motivation: Die Einzel-Queries scannen h3_lookup pro Aufruf komplett
+    # (DuckDB, kein Index) — bei ~5 Queries pro Feature dominiert das die
+    # Beschreibungs-Generierung. Die Batch-Varianten tragen src_id durch alle
+    # CTEs und amortisieren die Scans ueber hunderte Quell-Features.
+    # -------------------------------------------------------------------------
+
+    def find_intersecting_features_batch(
+        self,
+        feature_ids: list[int],
+        objektart_list: list[str] | None = None,
+        exclude_self: bool = True,
+    ) -> duckdb.DuckDBPyRelation:
+        """Batch-Variante von find_intersecting_features.
+
+        Args:
+            feature_ids: IDs der Quell-Features
+            objektart_list: Optionale Liste von OBJEKTART-Werten zum Filtern
+            exclude_self: Quell-Feature aus den eigenen Treffern ausschliessen
+                (entspricht exclude_id=feature_id im Einzel-Query)
+
+        Returns:
+            DuckDBPyRelation mit Spalten: src_id, feature_id, NAME, OBJEKTART,
+            source, UUID — sortiert nach (src_id, feature_id), d.h. pro Feature
+            dieselbe Reihenfolge wie der Einzel-Query.
+        """
+        if not self._has_lookup_table():
+            raise RuntimeError(
+                "h3_lookup Tabelle nicht gefunden. "
+                "Bitte zuerst erstellen via Build-Pipeline."
+            )
+
+        ids_str = ", ".join(str(int(i)) for i in feature_ids)
+        where_parts = ["f.NAME IS NOT NULL"]
+        if objektart_list:
+            quoted = ", ".join(f"'{o}'" for o in objektart_list)
+            where_parts.append(f"f.OBJEKTART IN ({quoted})")
+        if exclude_self:
+            where_parts.append("f.feature_id != m.src_id")
+        where_clause = " AND ".join(where_parts)
+
+        sql = f"""
+            WITH source AS (
+                SELECT feature_id AS src_id, cell, cell_res
+                FROM h3_lookup
+                WHERE feature_id IN ({ids_str})
+            ),
+            coarser_matches AS (
+                SELECT DISTINCT sp.src_id, l.feature_id
+                FROM h3_lookup l
+                JOIN (
+                    SELECT DISTINCT
+                        s.src_id,
+                        h3_cell_to_parent(s.cell, tr.cell_res) as parent_cell,
+                        tr.cell_res as target_res
+                    FROM source s,
+                         (SELECT DISTINCT cell_res FROM h3_lookup) tr
+                    WHERE tr.cell_res <= s.cell_res
+                ) sp ON l.cell = sp.parent_cell AND l.cell_res = sp.target_res
+            ),
+            finer_matches AS (
+                -- Equi-Join-Formulierung: h3_cell_to_parent haengt nur von
+                -- l.cell und der (wenige Werte umfassenden) Source-Resolution
+                -- ab; so kann DuckDB hash-joinen statt nested-loopen.
+                SELECT DISTINCT s.src_id, lp.feature_id
+                FROM (
+                    SELECT l.feature_id,
+                           sr.cell_res AS src_res,
+                           h3_cell_to_parent(l.cell, sr.cell_res) AS parent_cell
+                    FROM h3_lookup l
+                    JOIN (SELECT DISTINCT cell_res FROM source) sr
+                      ON l.cell_res > sr.cell_res
+                ) lp
+                JOIN source s ON s.cell_res = lp.src_res AND s.cell = lp.parent_cell
+            ),
+            all_matches AS (
+                SELECT src_id, feature_id FROM coarser_matches
+                UNION
+                SELECT src_id, feature_id FROM finer_matches
+            )
+            SELECT DISTINCT m.src_id, f.feature_id, f.NAME, f.OBJEKTART, f.source, f.UUID
+            FROM all_matches m
+            JOIN features f ON m.feature_id = f.feature_id
+            WHERE {where_clause}
+            ORDER BY m.src_id, f.feature_id
+        """
+
+        return self.conn.sql(sql)
+
+    def find_overlapping_features_batch(
+        self,
+        feature_ids: list[int],
+        objektart: str | None = None,
+        max_results: int = 5,
+    ) -> duckdb.DuckDBPyRelation:
+        """Batch-Variante von find_overlapping_features.
+
+        Pro Quell-Feature die Top-max_results Treffer nach Overlap-Groesse
+        (Tie-Break: feature_id), identisch zum Einzel-Query.
+
+        Returns:
+            DuckDBPyRelation mit Spalten: src_id, feature_id, NAME, OBJEKTART,
+            overlap_cells — sortiert nach (src_id, Rang).
+        """
+        if not self._has_lookup_table():
+            raise RuntimeError(
+                "h3_lookup Tabelle nicht gefunden. "
+                "Bitte zuerst erstellen via Build-Pipeline."
+            )
+
+        ids_str = ", ".join(str(int(i)) for i in feature_ids)
+        feature_filters = ["f.NAME IS NOT NULL"]
+        if objektart is not None:
+            feature_filters.append(f"f.OBJEKTART = '{objektart}'")
+            res_filter = f"""
+                SELECT DISTINCT l2.cell_res FROM h3_lookup l2
+                JOIN features f2 ON l2.feature_id = f2.feature_id
+                WHERE f2.OBJEKTART = '{objektart}'
+            """
+            target_subquery = f"SELECT feature_id FROM features WHERE OBJEKTART = '{objektart}'"
+            lookup_extra = f"\n                AND l.feature_id IN ({target_subquery})"
+        else:
+            res_filter = "SELECT DISTINCT cell_res FROM h3_lookup"
+            lookup_extra = ""
+
+        sql = f"""
+            WITH source AS (
+                SELECT feature_id AS src_id, cell, cell_res
+                FROM h3_lookup
+                WHERE feature_id IN ({ids_str})
+            ),
+            coarser_matches AS (
+                SELECT sp.src_id, l.feature_id, COUNT(*) as overlap_cells
+                FROM h3_lookup l
+                JOIN (
+                    SELECT DISTINCT
+                        s.src_id,
+                        h3_cell_to_parent(s.cell, tr.cell_res) as parent_cell,
+                        tr.cell_res as target_res
+                    FROM source s,
+                         ({res_filter}) tr
+                    WHERE tr.cell_res <= s.cell_res
+                ) sp ON l.cell = sp.parent_cell AND l.cell_res = sp.target_res{lookup_extra}
+                GROUP BY sp.src_id, l.feature_id
+            ),
+            finer_matches AS (
+                -- Equi-Join-Formulierung (vgl. find_intersecting_features_batch)
+                SELECT s.src_id, lp.feature_id, COUNT(*) as overlap_cells
+                FROM (
+                    SELECT l.feature_id,
+                           sr.cell_res AS src_res,
+                           h3_cell_to_parent(l.cell, sr.cell_res) AS parent_cell
+                    FROM h3_lookup l
+                    JOIN (SELECT DISTINCT cell_res FROM source) sr
+                      ON l.cell_res > sr.cell_res{lookup_extra}
+                ) lp
+                JOIN source s ON s.cell_res = lp.src_res AND s.cell = lp.parent_cell
+                GROUP BY s.src_id, lp.feature_id
+            ),
+            all_matches AS (
+                SELECT src_id, feature_id, SUM(overlap_cells) as overlap_cells
+                FROM (
+                    SELECT * FROM coarser_matches
+                    UNION ALL
+                    SELECT * FROM finer_matches
+                )
+                GROUP BY src_id, feature_id
+            ),
+            ranked AS (
+                SELECT m.src_id, f.feature_id, f.NAME, f.OBJEKTART, m.overlap_cells,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY m.src_id
+                           ORDER BY m.overlap_cells DESC, f.feature_id
+                       ) AS rn
+                FROM all_matches m
+                JOIN features f ON m.feature_id = f.feature_id
+                WHERE {' AND '.join(feature_filters)}
+            )
+            SELECT src_id, feature_id, NAME, OBJEKTART, overlap_cells
+            FROM ranked
+            WHERE rn <= {int(max_results)}
+            ORDER BY src_id, rn
         """
 
         return self.conn.sql(sql)
