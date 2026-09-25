@@ -1,5 +1,5 @@
 [tool.poetry]
-name = "h3-multi-resolution-index"
+name = "h3-multi-resolution-engine"
 version = "0.1.0"
 description = "H3 multi-resolution spatial index with DuckDB backend"
 authors = ["Sebastian Gmur"]
